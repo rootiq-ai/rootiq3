@@ -1,0 +1,154 @@
+version: '3.8'
+
+services:
+  # PostgreSQL Database
+  postgres:
+    image: postgres:15-alpine
+    container_name: alert-monitoring-postgres
+    environment:
+      POSTGRES_DB: alertdb
+      POSTGRES_USER: alertuser
+      POSTGRES_PASSWORD: alertpass
+      POSTGRES_HOST_AUTH_METHOD: trust
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./scripts/init-db.sql:/docker-entrypoint-initdb.d/init-db.sql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U alertuser -d alertdb"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - alert-monitoring-network
+
+  # Ollama Service
+  ollama:
+    image: ollama/ollama:latest
+    container_name: alert-monitoring-ollama
+    ports:
+      - "11434:11434"
+    volumes:
+      - ollama_data:/root/.ollama
+    environment:
+      - OLLAMA_HOST=0.0.0.0
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:11434/api/tags"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    networks:
+      - alert-monitoring-network
+    # Note: You'll need to pull the llama3 model after starting:
+    # docker exec -it alert-monitoring-ollama ollama pull llama3
+
+  # Backend API
+  backend:
+    build:
+      context: .
+      dockerfile: backend/Dockerfile
+    container_name: alert-monitoring-backend
+    ports:
+      - "8000:8000"
+    environment:
+      - DATABASE_URL=postgresql://alertuser:alertpass@postgres:5432/alertdb
+      - OLLAMA_HOST=http://ollama:11434
+      - OLLAMA_MODEL=llama3
+      - CHROMADB_PATH=/app/chromadb_data
+      - DEBUG=true
+    volumes:
+      - chromadb_data:/app/chromadb_data
+      - ./backend:/app
+    depends_on:
+      postgres:
+        condition: service_healthy
+      ollama:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    networks:
+      - alert-monitoring-network
+    restart: unless-stopped
+
+  # Frontend Dashboard
+  frontend:
+    build:
+      context: .
+      dockerfile: frontend/Dockerfile
+    container_name: alert-monitoring-frontend
+    ports:
+      - "8501:8501"
+    environment:
+      - API_BASE_URL=http://backend:8000
+    volumes:
+      - ./frontend:/app
+    depends_on:
+      backend:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8501/_stcore/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    networks:
+      - alert-monitoring-network
+    restart: unless-stopped
+
+  # Database Initialization Service (runs once)
+  db-init:
+    build:
+      context: .
+      dockerfile: scripts/Dockerfile.init
+    container_name: alert-monitoring-db-init
+    environment:
+      - DATABASE_URL=postgresql://alertuser:alertpass@postgres:5432/alertdb
+      - CHROMADB_PATH=/app/chromadb_data
+    volumes:
+      - chromadb_data:/app/chromadb_data
+      - ./scripts:/app/scripts
+      - ./backend:/app/backend
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks:
+      - alert-monitoring-network
+    command: >
+      sh -c "
+        echo 'Initializing databases...' &&
+        python /app/scripts/setup_db.py &&
+        python /app/scripts/setup_chromadb.py &&
+        echo 'Database initialization completed'
+      "
+
+volumes:
+  postgres_data:
+    driver: local
+  ollama_data:
+    driver: local
+  chromadb_data:
+    driver: local
+
+networks:
+  alert-monitoring-network:
+    driver: bridge
+
+# Development override file support
+# Create docker-compose.override.yml for local development
+# Example override for development:
+# ---
+# version: '3.8'
+# services:
+#   backend:
+#     volumes:
+#       - ./backend:/app
+#     environment:
+#       - DEBUG=true
+#       - RELOAD=true
+#   frontend:
+#     volumes:
+#       - ./frontend:/app
+#     command: streamlit run streamlit_app.py --server.address 0.0.0.0 --server.port 8501 --server.runOnSave true
